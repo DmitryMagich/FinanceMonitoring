@@ -1,7 +1,5 @@
 using FinanceCalculator.Entities;
-using FinanceCalculator.Modules.MonoAPI;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Options;
 
 namespace FinanceCalculator.Modules.RestAPI;
 
@@ -20,7 +18,6 @@ public static class TransactionEndpoints
         // === список ===
         app.MapGet("/api/transactions", async (
             AppDbContext db,
-            IOptions<TimeOptions> timeOpts,
             Guid? accountId,
             DateOnly? from,
             DateOnly? to,
@@ -29,24 +26,22 @@ public static class TransactionEndpoints
             string? search,
             int? take) =>
         {
-            var offset = TimeSpan.FromHours(timeOpts.Value.TimeZoneOffsetHours);
             var q = db.Transactions.AsQueryable();
 
             if (accountId is not null)
                 q = q.Where(t => t.AccountId == accountId);
 
+            // ФИКС: сравнение с локальным naive-временем, без UTC-конвертации
             if (from is not null)
             {
-                var utcFrom = new DateTimeOffset(from.Value.ToDateTime(TimeOnly.MinValue), offset)
-                    .ToUniversalTime().UtcDateTime;
-                q = q.Where(t => t.Time >= utcFrom);
+                var fromDt = from.Value.ToDateTime(TimeOnly.MinValue);
+                q = q.Where(t => t.Time >= fromDt);
             }
 
             if (to is not null)
             {
-                var utcTo = new DateTimeOffset(to.Value.ToDateTime(TimeOnly.MaxValue), offset)
-                    .ToUniversalTime().UtcDateTime;
-                q = q.Where(t => t.Time <= utcTo);
+                var toDt = to.Value.ToDateTime(TimeOnly.MaxValue);
+                q = q.Where(t => t.Time <= toDt);
             }
 
             if (minAmount is not null)
@@ -70,7 +65,10 @@ public static class TransactionEndpoints
             }
 
             return await q
+                // ФИКС: tie-breaker, иначе две manual-транзакции с одинаковым Time
+                // идут в непредсказуемом порядке
                 .OrderByDescending(t => t.Time)
+                .ThenByDescending(t => t.CreatedAt)
                 .Take(take ?? 200)
                 .Select(t => new
                 {
@@ -92,11 +90,8 @@ public static class TransactionEndpoints
         // === создать ручную ===
         app.MapPost("/api/transactions", async (
             AppDbContext db,
-            IOptions<TimeOptions> timeOpts,
             CreateTransactionRequest req) =>
         {
-            var offset = TimeSpan.FromHours(timeOpts.Value.TimeZoneOffsetHours);
-
             if (req.AmountUah == 0)
                 return Results.BadRequest("Amount must not be zero");
 
@@ -117,10 +112,18 @@ public static class TransactionEndpoints
                     return Results.BadRequest("Cash account not found");
             }
 
-            DateTime localDate = req.Date ?? DateTime.UtcNow.Add(offset).Date;
-            var utcTime = new DateTimeOffset(
-                DateTime.SpecifyKind(localDate, DateTimeKind.Unspecified), offset
-            ).ToUniversalTime().UtcDateTime;
+            // ФИКС: сохраняем ЛОКАЛЬНОЕ naive-время, никакого UTC.
+            // Если дата == сегодня — берём текущее время, чтобы не падало на 00:00.
+            DateTime localTime;
+            if (req.Date is { } d)
+            {
+                var datePart = d.Date;
+                localTime = datePart == DateTime.Today ? DateTime.Now : datePart;
+            }
+            else
+            {
+                localTime = DateTime.Now;
+            }
 
             var tx = new Transaction
             {
@@ -128,7 +131,7 @@ public static class TransactionEndpoints
                 AccountId = account.Id,
                 ExternalId = Guid.NewGuid().ToString(),
                 Source = TransactionSource.Manual,
-                Time = utcTime,
+                Time = localTime,
                 Description = req.Description,
                 Amount = (long)Math.Round(req.AmountUah * 100),
                 Balance = 0,
